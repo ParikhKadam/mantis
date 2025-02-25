@@ -16,7 +16,7 @@
 
 package io.mantisrx.runtime.sink;
 
-import io.mantisrx.common.properties.MantisPropertiesService;
+import io.mantisrx.common.properties.MantisPropertiesLoader;
 import io.mantisrx.runtime.Context;
 import io.mantisrx.runtime.Metadata;
 import io.mantisrx.runtime.PortRequest;
@@ -24,10 +24,12 @@ import io.mantisrx.runtime.sink.predicate.Predicate;
 import io.mantisrx.server.core.ServiceRegistry;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelOption;
+import io.netty.channel.WriteBufferWaterMark;
 import io.reactivex.mantis.network.push.PushServerSse;
 import io.reactivex.mantis.network.push.PushServers;
 import io.reactivex.mantis.network.push.Routers;
 import io.reactivex.mantis.network.push.ServerConfig;
+import io.reactivex.mantis.network.push.Router;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
@@ -54,7 +56,8 @@ public class ServerSentEventsSink<T> implements SelfDocumentingSink<T> {
     private Func2<Map<String, List<String>>, Context, Void> requestPreprocessor;
     private Func2<Map<String, List<String>>, Context, Void> requestPostprocessor;
     private int port = -1;
-    private final MantisPropertiesService propService;
+    private final MantisPropertiesLoader propService;
+    private final Router<T> router;
 
     private PushServerSse<T, Context> pushServerSse;
     private HttpServer<ByteBuf, ServerSentEvent> httpServer;
@@ -64,8 +67,8 @@ public class ServerSentEventsSink<T> implements SelfDocumentingSink<T> {
     }
 
     ServerSentEventsSink(Func1<T, String> encoder,
-        Func1<Throwable, String> errorEncoder,
-        Predicate<T> predicate) {
+                         Func1<Throwable, String> errorEncoder,
+                         Predicate<T> predicate) {
         if (errorEncoder == null) {
             // default
             errorEncoder = Throwable::getMessage;
@@ -75,6 +78,7 @@ public class ServerSentEventsSink<T> implements SelfDocumentingSink<T> {
         this.predicate = predicate;
         this.propService = ServiceRegistry.INSTANCE.getPropertiesService();
         this.subscribeProcessor = null;
+        this.router = null;
     }
 
     ServerSentEventsSink(Builder<T> builder) {
@@ -85,6 +89,7 @@ public class ServerSentEventsSink<T> implements SelfDocumentingSink<T> {
         this.requestPostprocessor = builder.requestPostprocessor;
         this.subscribeProcessor = builder.subscribeProcessor;
         this.propService = ServiceRegistry.INSTANCE.getPropertiesService();
+        this.router = builder.router;
     }
 
     @Override
@@ -127,6 +132,11 @@ public class ServerSentEventsSink<T> implements SelfDocumentingSink<T> {
         return Integer.parseInt(maxChunkSize);
     }
 
+    private int maxNotWritableTimeSec() {
+        String maxNotWritableTimeSec = propService.getStringValue("mantis.sse.maxNotWritableTimeSec", "-1");
+        return Integer.parseInt(maxNotWritableTimeSec);
+    }
+
     private int bufferCapacity() {
         String bufferCapacityString = propService.getStringValue("mantis.sse.bufferCapacity", "25000");
         return Integer.parseInt(bufferCapacityString);
@@ -140,13 +150,13 @@ public class ServerSentEventsSink<T> implements SelfDocumentingSink<T> {
     @Override
     public void call(Context context, PortRequest portRequest, final Observable<T> observable) {
         port = portRequest.getPort();
-        if (runNewSseServerImpl(context.getWorkerInfo().getJobName())) {
+        if (runNewSseServerImpl(context.getWorkerInfo().getJobClusterName())) {
             LOG.info("Serving modern HTTP SSE server sink on port: " + port);
 
             String serverName = "SseSink";
             ServerConfig.Builder<T> config = new ServerConfig.Builder<T>()
                 .name(serverName)
-                .groupRouter(Routers.roundRobinSse(serverName, encoder))
+                .groupRouter(router != null ? router : Routers.roundRobinSse(serverName, encoder))
                 .port(port)
                 .metricsRegistry(context.getMetricsRegistry())
                 .maxChunkTimeMSec(maxReadTime())
@@ -154,7 +164,8 @@ public class ServerSentEventsSink<T> implements SelfDocumentingSink<T> {
                 .bufferCapacity(bufferCapacity())
                 .numQueueConsumers(numConsumerThreads())
                 .useSpscQueue(useSpsc())
-                .maxChunkTimeMSec(getBatchInterval());
+                .maxChunkTimeMSec(getBatchInterval())
+                .maxNotWritableTimeSec(maxNotWritableTimeSec());
             if (predicate != null) {
                 config.predicate(predicate.getPredicate());
             }
@@ -178,8 +189,7 @@ public class ServerSentEventsSink<T> implements SelfDocumentingSink<T> {
                         context,
                         batchInterval))
                 .pipelineConfigurator(PipelineConfigurators.<ByteBuf>serveSseConfigurator())
-                .channelOption(ChannelOption.WRITE_BUFFER_HIGH_WATER_MARK, 5 * 1024 * 1024)
-                .channelOption(ChannelOption.WRITE_BUFFER_LOW_WATER_MARK, 1024 * 1024)
+                .channelOption(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(1024 * 1024, 5 * 1024 * 1024))
                 .build();
             httpServer.start();
         }
@@ -243,6 +253,7 @@ public class ServerSentEventsSink<T> implements SelfDocumentingSink<T> {
         private Func1<Throwable, String> errorEncoder = Throwable::getMessage;
         private Predicate<T> predicate;
         private Func2<Map<String, List<String>>, Context, Void> subscribeProcessor;
+        private Router<T> router;
 
         public Builder<T> withEncoder(Func1<T, String> encoder) {
             this.encoder = encoder;
@@ -272,6 +283,11 @@ public class ServerSentEventsSink<T> implements SelfDocumentingSink<T> {
 
         public Builder<T> withRequestPostprocessor(Func2<Map<String, List<String>>, Context, Void> postProcessor) {
             this.requestPostprocessor = postProcessor;
+            return this;
+        }
+
+        public Builder<T> withRouter(Router<T> router) {
+            this.router = router;
             return this;
         }
 
